@@ -39,7 +39,7 @@ def after_request(response):
 # =============================================================================
 # CONFIGURACIÓN
 # =============================================================================
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://youtube_seguro_db_user:mgWfcZLM4Q4O4YXHkgzmAQen0972ogvQ@dpg-d62iu1shg0os73ekkqdg-a/youtube_seguro_db")
 EMBEDDING_DIM = 256
 LEARNING_RATE = 0.001
 TOP_K_RESULTS = 5
