@@ -1,6 +1,6 @@
 """
 =============================================================================
-NeuroBot API v2.0 - PostgreSQL Edition para Render Free Tier
+NeuroBot API v2.1 - PostgreSQL Edition (CORS Fixed)
 =============================================================================
 """
 
@@ -8,7 +8,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import psycopg2
 from psycopg2 import pool
-import json, os, io, hashlib, re
+import json, os, io, hashlib, re, traceback
 from datetime import datetime
 import urllib.request
 from html.parser import HTMLParser
@@ -20,33 +20,62 @@ import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
+# =============================================================================
+# FLASK APP + CORS (EXPLICIT)
+# =============================================================================
 app = Flask(__name__)
-CORS(app)
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://youtube_seguro_db_user:mgWfcZLM4Q4O4YXHkgzmAQen0972ogvQ@dpg-d62iu1shg0os73ekkqdg-a/youtube_seguro_db")
+# CORS explícito: permite CUALQUIER origen
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
+
+# Headers CORS manuales como fallback
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS')
+    return response
+
+# =============================================================================
+# CONFIGURACIÓN
+# =============================================================================
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 EMBEDDING_DIM = 256
 LEARNING_RATE = 0.001
 TOP_K_RESULTS = 5
 MIN_CHUNK_LENGTH = 50
 MAX_CHUNK_LENGTH = 1000
 
+# =============================================================================
+# POOL DE CONEXIONES PostgreSQL
+# =============================================================================
 db_pool = None
 
 def get_db_pool():
     global db_pool
     if db_pool is None:
-        db_pool = pool.ThreadedConnectionPool(minconn=1, maxconn=5, dsn=DATABASE_URL)
+        if not DATABASE_URL:
+            raise Exception("DATABASE_URL no configurada. Agrega la variable de entorno en Render.")
+        dsn = DATABASE_URL
+        # Render a veces da postgres:// en vez de postgresql://
+        if dsn.startswith("postgres://"):
+            dsn = dsn.replace("postgres://", "postgresql://", 1)
+        db_pool = pool.ThreadedConnectionPool(minconn=1, maxconn=5, dsn=dsn)
     return db_pool
 
 def get_conn():
     return get_db_pool().getconn()
 
 def put_conn(conn):
-    get_db_pool().putconn(conn)
+    try:
+        get_db_pool().putconn(conn)
+    except Exception:
+        pass
 
 
-# --- REDES NEURONALES ---
-
+# =============================================================================
+# REDES NEURONALES
+# =============================================================================
 class KnowledgeEncoder(nn.Module):
     def __init__(self, input_dim, embedding_dim=EMBEDDING_DIM):
         super().__init__()
@@ -89,8 +118,9 @@ class AttentionRanker(nn.Module):
         return scores, context, attn_weights
 
 
-# --- PROCESADORES DE DOCUMENTOS ---
-
+# =============================================================================
+# PROCESADORES DE DOCUMENTOS
+# =============================================================================
 class HTMLTextExtractor(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -146,8 +176,9 @@ def extract_text_from_url(url):
     return ext.get_text()
 
 
-# --- MOTOR DE CONOCIMIENTO ---
-
+# =============================================================================
+# MOTOR DE CONOCIMIENTO
+# =============================================================================
 class KnowledgeEngine:
     def __init__(self):
         self.vectorizer = TfidfVectorizer(max_features=5000, ngram_range=(1, 3), sublinear_tf=True)
@@ -159,12 +190,14 @@ class KnowledgeEngine:
         self.knowledge_embeddings = None
         self.knowledge_texts = []
         self.knowledge_ids = []
-        self._init_db()
-        self._load_knowledge()
+        self.db_ready = False
 
-    def _init_db(self):
-        conn = get_conn()
+    def init_db(self):
+        """Inicializa BD. Se llama después de que la app arranca."""
+        if self.db_ready:
+            return True
         try:
+            conn = get_conn()
             with conn.cursor() as c:
                 c.execute("""CREATE TABLE IF NOT EXISTS knowledge (
                     id VARCHAR(16) PRIMARY KEY, content TEXT NOT NULL,
@@ -189,12 +222,25 @@ class KnowledgeEngine:
                     updated_at TIMESTAMP DEFAULT NOW()
                 )""")
             conn.commit()
-            print("✅ Tablas PostgreSQL listas")
-        except Exception as e:
-            conn.rollback()
-            raise e
-        finally:
             put_conn(conn)
+            self.db_ready = True
+            print("✅ Tablas PostgreSQL listas")
+            self._load_knowledge()
+            return True
+        except Exception as e:
+            print(f"⚠️  Error BD: {e}")
+            traceback.print_exc()
+            try:
+                put_conn(conn)
+            except:
+                pass
+            return False
+
+    def _ensure_db(self):
+        """Asegura que la BD esté lista antes de cualquier operación."""
+        if not self.db_ready:
+            self.init_db()
+        return self.db_ready
 
     def _load_knowledge(self):
         conn = get_conn()
@@ -242,13 +288,14 @@ class KnowledgeEngine:
             loss.backward()
             self.optimizer_enc.step()
             fl = loss.item()
-        conn = get_conn()
         try:
+            conn = get_conn()
             with conn.cursor() as c:
-                c.execute("INSERT INTO training_log (epoch, loss, num_samples) VALUES (%s,%s,%s)", (epochs, fl, X.size(0)))
+                c.execute("INSERT INTO training_log (epoch,loss,num_samples) VALUES (%s,%s,%s)", (epochs, fl, X.size(0)))
             conn.commit()
-        finally:
             put_conn(conn)
+        except:
+            pass
 
     def _train_from_feedback(self, q_emb, relevant_ids, score):
         if self.ranker is None or self.knowledge_embeddings is None:
@@ -300,6 +347,8 @@ class KnowledgeEngine:
         return final
 
     def add_knowledge(self, text, source="manual", source_type="text", metadata=None):
+        if not self._ensure_db():
+            return []
         chunks = self._chunk_text(text)
         added = []
         conn = get_conn()
@@ -317,6 +366,9 @@ class KnowledgeEngine:
                         self.knowledge_ids.append(cid)
                         self.knowledge_texts.append(chunk)
             conn.commit()
+        except Exception as e:
+            print(f"⚠️  Error add_knowledge: {e}")
+            conn.rollback()
         finally:
             put_conn(conn)
         if added:
@@ -324,9 +376,13 @@ class KnowledgeEngine:
         return added
 
     def query(self, question, top_k=TOP_K_RESULTS):
+        if not self._ensure_db():
+            return {"error": "Base de datos no disponible", "answer_chunks": [], "confidence": 0}
+
         if not self.is_fitted or len(self.knowledge_texts) < 2:
             return {"answer_chunks": [], "confidence": 0.0,
-                    "message": "Aún no tengo suficiente conocimiento. Aliméntame con documentos."}
+                    "message": "Aún no tengo suficiente conocimiento. Aliméntame con documentos primero.",
+                    "synthesized_answer": "Aún no tengo suficiente conocimiento. Ve a la pestaña 'Enseñar' y aliméntame con texto, URLs o documentos."}
 
         q_tfidf = self.vectorizer.transform([question])
         q_tensor = torch.FloatTensor(q_tfidf.toarray())
@@ -365,7 +421,8 @@ class KnowledgeEngine:
         avg = np.mean([r["relevance_score"] for r in results]) if results else 0
 
         return {"interaction_id": iid, "answer_chunks": results, "confidence": round(float(avg), 4),
-                "total_knowledge": len(self.knowledge_texts), "synthesized_answer": self._synthesize(results)}
+                "total_knowledge": len(self.knowledge_texts),
+                "synthesized_answer": self._synthesize(results)}
 
     def _synthesize(self, chunks):
         if not chunks:
@@ -387,11 +444,16 @@ class KnowledgeEngine:
                           (question, json.dumps(chunk_ids)))
                 iid = c.fetchone()[0]
             conn.commit()
+        except Exception as e:
+            print(f"⚠️  Error log: {e}")
+            conn.rollback()
         finally:
             put_conn(conn)
         return iid
 
     def get_stats(self):
+        if not self._ensure_db():
+            return {"error": "BD no disponible"}
         conn = get_conn()
         try:
             with conn.cursor() as c:
@@ -417,6 +479,8 @@ class KnowledgeEngine:
             put_conn(conn)
 
     def provide_feedback(self, interaction_id, score):
+        if not self._ensure_db():
+            return {"error": "BD no disponible"}
         conn = get_conn()
         try:
             with conn.cursor() as c:
@@ -472,16 +536,24 @@ class KnowledgeEngine:
             put_conn(conn)
 
 
-# --- INSTANCIA GLOBAL ---
+# =============================================================================
+# INSTANCIA GLOBAL (lazy init - no crash si BD no disponible al arrancar)
+# =============================================================================
 engine = KnowledgeEngine()
 
 
-# --- API ROUTES ---
+# =============================================================================
+# API ROUTES
+# =============================================================================
 
 @app.route("/")
 def home():
-    return jsonify({"name": "NeuroBot API", "version": "2.0.0", "database": "PostgreSQL",
+    return jsonify({
+        "name": "NeuroBot API",
+        "version": "2.1.0",
+        "database": "PostgreSQL",
         "endpoints": {
+            "GET /health": "Health check",
             "POST /learn/text": "Aprender de texto",
             "POST /learn/document": "Aprender de PDF/DOCX/TXT",
             "POST /learn/url": "Aprender de web",
@@ -490,9 +562,10 @@ def home():
             "GET /stats": "Estadísticas",
             "GET /knowledge": "Listar conocimiento",
             "POST /save": "Guardar modelo en BD",
-            "POST /load": "Cargar modelo de BD",
-            "GET /health": "Health check"
-        }})
+            "POST /load": "Cargar modelo de BD"
+        }
+    })
+
 
 @app.route("/health")
 def health():
@@ -501,9 +574,12 @@ def health():
         with conn.cursor() as c:
             c.execute("SELECT 1")
         put_conn(conn)
-        return jsonify({"status": "healthy", "db": "connected"})
+        # Init tables on first health check
+        engine.init_db()
+        return jsonify({"status": "healthy", "db": "connected", "model": engine.is_fitted})
     except Exception as e:
         return jsonify({"status": "unhealthy", "error": str(e)}), 500
+
 
 @app.route("/learn/text", methods=["POST"])
 def learn_text():
@@ -514,6 +590,7 @@ def learn_text():
                                   source_type="text", metadata=data.get("metadata", {}))
     return jsonify({"status": "learned", "chunks_added": len(added), "chunks": added,
                     "total_knowledge": len(engine.knowledge_texts)})
+
 
 @app.route("/learn/document", methods=["POST"])
 def learn_document():
@@ -545,6 +622,7 @@ def learn_document():
         if os.path.exists(tmp):
             os.remove(tmp)
 
+
 @app.route("/learn/url", methods=["POST"])
 def learn_url():
     data = request.get_json()
@@ -559,6 +637,7 @@ def learn_url():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 @app.route("/ask", methods=["POST"])
 def ask():
     data = request.get_json()
@@ -569,6 +648,7 @@ def ask():
         engine.add_knowledge(f"Pregunta frecuente: {q}", source="user_questions", source_type="interaction")
     return jsonify(engine.query(q, top_k=data.get("top_k", TOP_K_RESULTS)))
 
+
 @app.route("/feedback", methods=["POST"])
 def feedback():
     data = request.get_json()
@@ -576,12 +656,16 @@ def feedback():
         return jsonify({"error": "Campos 'interaction_id' y 'score' requeridos"}), 400
     return jsonify(engine.provide_feedback(data["interaction_id"], max(-1, min(1, float(data["score"])))))
 
+
 @app.route("/stats")
 def stats():
     return jsonify(engine.get_stats())
 
+
 @app.route("/knowledge")
 def list_knowledge():
+    if not engine._ensure_db():
+        return jsonify({"error": "BD no disponible"}), 500
     page = request.args.get("page", 1, type=int)
     pp = request.args.get("per_page", 20, type=int)
     st = request.args.get("type", None)
@@ -601,11 +685,13 @@ def list_knowledge():
     finally:
         put_conn(conn)
 
+
 @app.route("/save", methods=["POST"])
 def save_models():
     if engine.save_models():
         return jsonify({"status": "saved", "storage": "PostgreSQL"})
     return jsonify({"error": "No hay modelos para guardar"}), 400
+
 
 @app.route("/load", methods=["POST"])
 def load_models():
@@ -614,7 +700,10 @@ def load_models():
     return jsonify({"error": "No hay pesos guardados"}), 404
 
 
+# =============================================================================
+# RUN
+# =============================================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"\n  NeuroBot API v2.0 | PostgreSQL | Puerto: {port}\n")
+    print(f"\n  NeuroBot API v2.1 | PostgreSQL | Puerto: {port}\n")
     app.run(host="0.0.0.0", port=port, debug=os.environ.get("FLASK_DEBUG", "false").lower() == "true")
